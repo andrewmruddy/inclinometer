@@ -10,7 +10,7 @@ use embassy_nrf::gpio::{Level, Output, OutputDrive};
 use embassy_nrf::spim::{self, Config as SpimConfig, Frequency, MODE_0, Spim};
 use embassy_time::{Duration, Timer};
 use embedded_graphics::{
-    mono_font::{MonoTextStyle, ascii::FONT_6X10, ascii::FONT_10X20},
+    mono_font::{MonoTextStyle, ascii::FONT_10X20},
     pixelcolor::BinaryColor,
     prelude::*,
     text::Text,
@@ -55,10 +55,8 @@ async fn display_task(
     display.clear_buffer();
 
     let title_style = MonoTextStyle::new(&FONT_10X20, BinaryColor::Off);
-    let body_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::Off);
 
-    let _ = Text::new("Hello!", Point::new(16, 32), title_style).draw(&mut display);
-    let _ = Text::new("nRF52840 Display", Point::new(16, 52), body_style).draw(&mut display);
+    let _ = Text::new("Ruddy Subsea", Point::new(16, 32), title_style).draw(&mut display);
     display.flush_buffer();
 
     loop {
