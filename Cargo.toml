@@ -16,6 +16,7 @@ embassy-time = "0.5"
 
 embedded-graphics = "0.7.1"
 embedded-hal = "0.2.7"
+heapless = "0.8"
 nb = "1.0"
 sharp-memory-display = { version = "0.3", default-features = false, features = ["ls027b7dh01"] }
 

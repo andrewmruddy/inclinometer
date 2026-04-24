@@ -9,12 +9,13 @@ This file gives coding agents the minimum project context needed to work safely 
 - Debug/flash hardware: Black Magic Probe for GDB debugging, plus `probe-rs` configured as the default Cargo runner
 - Language/runtime: Rust `no_std` firmware using Embassy async on `thumbv7em-none-eabihf`
 
-The current firmware lives entirely in `src/main.rs`. It:
+The current firmware lives entirely in `src/main.rs`. It currently:
 
-- configures `TWISPI0` as a TX-only SPI bus
-- drives the Sharp display over SPI
-- toggles the onboard LED in a periodic Embassy task
-- renders `"Ruddy Subsea"` once, then refreshes the display periodically
+- initializes Embassy on the Feather nRF52840
+- toggles the onboard LED in one Embassy task
+- uses a second Embassy task that owns the shared SPI bus
+- reads the Murata SCL3300 and updates the Sharp display from that same bus-owning task
+- renders live SCL3300 X/Y/Z angle values on the display
 
 ## Important Files
 
@@ -60,16 +61,28 @@ If the BMP serial device changes, update the device path before relying on those
 
 Current pin usage from `src/main.rs`:
 
-- `P0_14`: SPI SCK to Sharp display
-- `P0_13`: SPI MOSI / display DI
-- `P0_03`: display chip select
+- `TWISPI0`: shared SPI peripheral for Sharp display and SCL3300
+- `P0_14`: shared SPI SCK
+- `P0_13`: shared SPI MOSI / Sharp display DI / SCL3300 MOSI
+- `P0_15`: shared SPI MISO, used by the SCL3300
+- `P0_03`: Sharp display chip select (`A5`)
+- `P0_28`: SCL3300 CSB (`A3`)
 - `P1_15`: onboard LED
 
-Display-specific note:
+Display and sensor wiring notes:
 
-- the display `DISP` line is not software-controlled right now
-- firmware uses a dummy `TiedHighDisplayPin`
-- the code assumes `DISP` is physically tied high on the hardware
+- Sharp display `CS` is on `A5`
+- Sharp display `EMD` / `EXTMODE` is wired to `A4`
+- Sharp display `DISP` is held high in hardware
+- Sharp display `EIN` / `EXTCOMIN` is held low in hardware
+- SCL3300 `CSB` is on `A3`
+- current code assumes the SCL3300 shares `SCK` and `MOSI` with the display and uses `P0_15` as the shared `MISO` line
+
+nRF52840 Feather note:
+
+- avoid `SPIM3` for external SPI devices if the board may boot without USB/VBUS power
+- sharing `SPIM0/TWISPI0` between the display and SCL3300 is acceptable because both devices use SPI mode 0 and separate chip-select lines
+- a mutex would be appropriate if multiple independent tasks touched the shared bus, but the current implementation keeps sensor and display traffic inside one bus-owning task because the display driver performs multi-transfer transactions under one chip-select window
 
 When changing wiring or board definitions, update both the firmware comments and this file.
 
