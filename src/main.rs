@@ -418,10 +418,7 @@ impl DrawTarget for ScaledDrawTarget<'_, '_> {
                 self.offset.y + coord.y * self.scale as i32,
             );
             let style = PrimitiveStyle::with_fill(color);
-            let rect = Rectangle::new(
-                scaled_top_left,
-                Size::new(self.scale, self.scale),
-            );
+            let rect = Rectangle::new(scaled_top_left, Size::new(self.scale, self.scale));
             let _ = rect.into_styled(style).draw(self.display);
         }
 
