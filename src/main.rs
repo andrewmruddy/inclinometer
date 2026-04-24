@@ -16,7 +16,7 @@ use embassy_time::{Duration, Instant, Timer};
 use embedded_graphics::{
     mono_font::{
         ascii::{FONT_10X20, FONT_6X10},
-        MonoTextStyle,
+        MonoFont, MonoTextStyle,
     },
     pixelcolor::BinaryColor,
     prelude::*,
@@ -44,7 +44,8 @@ const SCL3300_SW_RESET: u32 = 0xB400_2098;
 
 static LED_TASK_US: AtomicU32 = AtomicU32::new(0);
 static SENSOR_TASK_US: AtomicU32 = AtomicU32::new(0);
-static DRAW_TASK_US: AtomicU32 = AtomicU32::new(0);
+static CPU_TASK_US: AtomicU32 = AtomicU32::new(0);
+static FLUSH_TASK_US: AtomicU32 = AtomicU32::new(0);
 static LOOP_TASK_US: AtomicU32 = AtomicU32::new(0);
 
 struct TiedHighDisplayPin;
@@ -105,6 +106,56 @@ enum SensorError {
 enum ScreenMode {
     Angles,
     Error,
+}
+
+struct UiState {
+    screen_mode: Option<ScreenMode>,
+    last_flush_at: Instant,
+    x_text: String<32>,
+    y_text: String<32>,
+    z_text: String<32>,
+    refresh_text: String<16>,
+    led_text: String<24>,
+    sensor_text: String<24>,
+    cpu_text: String<24>,
+    flush_text: String<24>,
+    loop_text: String<24>,
+    error_message: String<32>,
+    error_detail: String<32>,
+}
+
+impl UiState {
+    fn new(now: Instant) -> Self {
+        Self {
+            screen_mode: None,
+            last_flush_at: now,
+            x_text: String::new(),
+            y_text: String::new(),
+            z_text: String::new(),
+            refresh_text: String::new(),
+            led_text: String::new(),
+            sensor_text: String::new(),
+            cpu_text: String::new(),
+            flush_text: String::new(),
+            loop_text: String::new(),
+            error_message: String::new(),
+            error_detail: String::new(),
+        }
+    }
+
+    fn invalidate_dynamic_fields(&mut self) {
+        self.x_text.clear();
+        self.y_text.clear();
+        self.z_text.clear();
+        self.refresh_text.clear();
+        self.led_text.clear();
+        self.sensor_text.clear();
+        self.cpu_text.clear();
+        self.flush_text.clear();
+        self.loop_text.clear();
+        self.error_message.clear();
+        self.error_detail.clear();
+    }
 }
 
 struct Scl3300<'a> {
@@ -213,176 +264,432 @@ async fn sensor_display_task(
     let mut display = MemoryDisplay::new(display_spi, display_cs, display_disp);
     let mut sensor = Scl3300::new(&bus, sensor_cs);
     let mut refresh_count: u32 = 0;
-    let mut screen_mode = ScreenMode::Angles;
+    let mut ui_state = UiState::new(Instant::now());
 
     display.enable();
     display.set_clear_state(BinaryColor::On);
-    initialize_angle_screen(&mut display, refresh_count);
+    show_startup_splash(&mut display).await;
 
     if let Err(err) = sensor.initialize().await {
-        draw_sensor_error(&mut display, err, refresh_count);
         loop {
-            let started = Instant::now();
             refresh_count = refresh_count.wrapping_add(1);
-            draw_sensor_error(&mut display, err, refresh_count);
-            DRAW_TASK_US.store(elapsed_micros_u32(started), Ordering::Relaxed);
-            LOOP_TASK_US.store(elapsed_micros_u32(started), Ordering::Relaxed);
-            display.display_mode();
+            let loop_started = Instant::now();
+
+            if ui_state.screen_mode != Some(ScreenMode::Error) {
+                prepare_error_screen(&mut display, &mut ui_state);
+            }
+
+            let cpu_started = Instant::now();
+            let needs_flush = draw_sensor_error(&mut display, &mut ui_state, err, refresh_count);
+            let cpu_us = elapsed_micros_u32(cpu_started);
+            let flush_us = flush_or_keepalive(&mut display, &mut ui_state, needs_flush);
+            let loop_us = elapsed_micros_u32(loop_started);
+
+            CPU_TASK_US.store(cpu_us, Ordering::Relaxed);
+            FLUSH_TASK_US.store(flush_us, Ordering::Relaxed);
+            LOOP_TASK_US.store(loop_us, Ordering::Relaxed);
+
             Timer::after(Duration::from_millis(250)).await;
         }
     }
 
     loop {
-        let started = Instant::now();
         refresh_count = refresh_count.wrapping_add(1);
+        let loop_started = Instant::now();
 
         let sensor_started = Instant::now();
         let sensor_result = sensor.read_angles();
-        SENSOR_TASK_US.store(elapsed_micros_u32(sensor_started), Ordering::Relaxed);
+        let sensor_us = elapsed_micros_u32(sensor_started);
 
-        let draw_started = Instant::now();
-        match sensor_result {
+        let cpu_started = Instant::now();
+        let needs_flush = match sensor_result {
             Ok(readings) => {
-                if screen_mode != ScreenMode::Angles {
-                    initialize_angle_screen(&mut display, refresh_count);
-                    screen_mode = ScreenMode::Angles;
+                if ui_state.screen_mode != Some(ScreenMode::Angles) {
+                    prepare_angle_screen(&mut display, &mut ui_state);
                 }
-                draw_angle_screen(&mut display, readings, refresh_count);
+                draw_angle_screen(&mut display, &mut ui_state, readings, refresh_count)
             }
             Err(err) => {
-                screen_mode = ScreenMode::Error;
-                draw_sensor_error(&mut display, err, refresh_count);
+                if ui_state.screen_mode != Some(ScreenMode::Error) {
+                    prepare_error_screen(&mut display, &mut ui_state);
+                }
+                draw_sensor_error(&mut display, &mut ui_state, err, refresh_count)
             }
-        }
-        DRAW_TASK_US.store(elapsed_micros_u32(draw_started), Ordering::Relaxed);
+        };
+        let cpu_us = elapsed_micros_u32(cpu_started);
+        let flush_us = flush_or_keepalive(&mut display, &mut ui_state, needs_flush);
+        let loop_us = elapsed_micros_u32(loop_started);
 
-        LOOP_TASK_US.store(elapsed_micros_u32(started), Ordering::Relaxed);
-        display.display_mode();
+        SENSOR_TASK_US.store(sensor_us, Ordering::Relaxed);
+        CPU_TASK_US.store(cpu_us, Ordering::Relaxed);
+        FLUSH_TASK_US.store(flush_us, Ordering::Relaxed);
+        LOOP_TASK_US.store(loop_us, Ordering::Relaxed);
+
         Timer::after(Duration::from_millis(100)).await;
     }
 }
 
-fn initialize_angle_screen(
+async fn show_startup_splash(
     display: &mut MemoryDisplay<DisplaySpi<'_>, Output<'static>, TiedHighDisplayPin>,
-    refresh_count: u32,
 ) {
     display.clear_buffer();
+
+    draw_scaled_centered_text(display, "Ruddy", 5, 25);
+    draw_scaled_centered_text(display, "Subsea", 5, 125);
+
+    display.flush_buffer();
+    Timer::after(Duration::from_secs(5)).await;
+}
+
+fn draw_scaled_centered_text(
+    display: &mut MemoryDisplay<DisplaySpi<'_>, Output<'static>, TiedHighDisplayPin>,
+    text: &str,
+    scale: u32,
+    top_y: i32,
+) {
+    let width = scaled_text_width(&FONT_10X20, text, scale) as i32;
+    let start_x = ((400 - width) / 2).max(0);
+
+    for (index, ch) in text.chars().enumerate() {
+        let glyph_advance =
+            (FONT_10X20.character_size.width + FONT_10X20.character_spacing) * scale;
+        let glyph_x = start_x + (index as i32 * glyph_advance as i32);
+        draw_scaled_glyph(display, &FONT_10X20, ch, scale, Point::new(glyph_x, top_y));
+    }
+}
+
+fn scaled_text_width(font: &MonoFont<'_>, text: &str, scale: u32) -> u32 {
+    let char_count = text.chars().count() as u32;
+    if char_count == 0 {
+        0
+    } else {
+        ((font.character_size.width + font.character_spacing) * char_count - font.character_spacing) * scale
+    }
+}
+
+fn draw_scaled_glyph(
+    display: &mut MemoryDisplay<DisplaySpi<'_>, Output<'static>, TiedHighDisplayPin>,
+    font: &MonoFont<'_>,
+    ch: char,
+    scale: u32,
+    top_left: Point,
+) {
+    let glyphs_per_row = font.image.size().width / font.character_size.width;
+    let glyph_index = font.glyph_mapping.index(ch) as u32;
+    let row = glyph_index / glyphs_per_row;
+    let char_x = (glyph_index - (row * glyphs_per_row)) * font.character_size.width;
+    let char_y = row * font.character_size.height;
+    let glyph_area = Rectangle::new(
+        Point::new(char_x as i32, char_y as i32),
+        font.character_size,
+    );
+
+    let mut scaled_target = ScaledDrawTarget {
+        display,
+        offset: top_left,
+        scale,
+    };
+    let _ = font.image.draw_sub_image(&mut scaled_target, &glyph_area);
+}
+
+struct ScaledDrawTarget<'a, 'b> {
+    display: &'a mut MemoryDisplay<DisplaySpi<'b>, Output<'static>, TiedHighDisplayPin>,
+    offset: Point,
+    scale: u32,
+}
+
+impl OriginDimensions for ScaledDrawTarget<'_, '_> {
+    fn size(&self) -> Size {
+        Size::new(400, 240)
+    }
+}
+
+impl DrawTarget for ScaledDrawTarget<'_, '_> {
+    type Color = BinaryColor;
+    type Error = SpimError;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(coord, color) in pixels {
+            let scaled_top_left = Point::new(
+                self.offset.x + coord.x * self.scale as i32,
+                self.offset.y + coord.y * self.scale as i32,
+            );
+            let style = PrimitiveStyle::with_fill(color);
+            let rect = Rectangle::new(
+                scaled_top_left,
+                Size::new(self.scale, self.scale),
+            );
+            let _ = rect.into_styled(style).draw(self.display);
+        }
+
+        Ok(())
+    }
+}
+
+fn prepare_angle_screen(
+    display: &mut MemoryDisplay<DisplaySpi<'_>, Output<'static>, TiedHighDisplayPin>,
+    ui_state: &mut UiState,
+) {
+    display.clear_buffer();
+    ui_state.screen_mode = Some(ScreenMode::Angles);
+    ui_state.invalidate_dynamic_fields();
 
     let title_style = MonoTextStyle::new(&FONT_10X20, BinaryColor::Off);
     let body_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::Off);
 
     let _ = Text::new("SCL3300", Point::new(12, 20), title_style).draw(display);
     let _ = Text::new("angles in deg", Point::new(12, 108), body_style).draw(display);
-    draw_status_overlay(display, refresh_count);
-    display.flush_buffer();
 }
 
 fn draw_angle_screen(
     display: &mut MemoryDisplay<DisplaySpi<'_>, Output<'static>, TiedHighDisplayPin>,
+    ui_state: &mut UiState,
     readings: AngleReadings,
     refresh_count: u32,
-) {
+) -> bool {
     let body_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::Off);
-    let clear_style = PrimitiveStyle::with_fill(BinaryColor::On);
 
     let x_line = format_axis_line('X', readings.x_raw);
     let y_line = format_axis_line('Y', readings.y_raw);
     let z_line = format_axis_line('Z', readings.z_raw);
 
-    clear_line(display, 12, 44, 140, 12, clear_style);
-    clear_line(display, 12, 60, 140, 12, clear_style);
-    clear_line(display, 12, 76, 140, 12, clear_style);
+    let mut needs_flush = false;
+    needs_flush |= update_text_field(
+        display,
+        &mut ui_state.x_text,
+        &x_line,
+        12,
+        44,
+        140,
+        12,
+        12,
+        52,
+        body_style,
+    );
+    needs_flush |= update_text_field(
+        display,
+        &mut ui_state.y_text,
+        &y_line,
+        12,
+        60,
+        140,
+        12,
+        12,
+        68,
+        body_style,
+    );
+    needs_flush |= update_text_field(
+        display,
+        &mut ui_state.z_text,
+        &z_line,
+        12,
+        76,
+        140,
+        12,
+        12,
+        84,
+        body_style,
+    );
+    needs_flush |= draw_status_overlay(display, ui_state, refresh_count);
 
-    let _ = Text::new(&x_line, Point::new(12, 52), body_style).draw(display);
-    let _ = Text::new(&y_line, Point::new(12, 68), body_style).draw(display);
-    let _ = Text::new(&z_line, Point::new(12, 84), body_style).draw(display);
-    draw_status_overlay(display, refresh_count);
-
-    display.flush_buffer();
+    needs_flush
 }
 
-fn draw_sensor_error(
+fn prepare_error_screen(
     display: &mut MemoryDisplay<DisplaySpi<'_>, Output<'static>, TiedHighDisplayPin>,
-    error: SensorError,
-    refresh_count: u32,
+    ui_state: &mut UiState,
 ) {
     display.clear_buffer();
+    ui_state.screen_mode = Some(ScreenMode::Error);
+    ui_state.invalidate_dynamic_fields();
 
     let title_style = MonoTextStyle::new(&FONT_10X20, BinaryColor::Off);
     let body_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::Off);
 
     let _ = Text::new("SCL3300", Point::new(12, 20), title_style).draw(display);
     let _ = Text::new("sensor error", Point::new(12, 44), body_style).draw(display);
+}
 
-    let message = match error {
-        SensorError::Spi => "SPI transfer failed",
-        SensorError::Crc => "CRC mismatch",
-        SensorError::UnexpectedResponse => "off-frame mismatch",
-        SensorError::StartupStatus(0) => "startup in progress",
-        SensorError::StartupStatus(1) => "status says ok",
-        SensorError::StartupStatus(3) => "status flag set",
-        SensorError::StartupStatus(_) => "status reserved",
-        SensorError::WhoAmI(_) => "WHOAMI mismatch",
-    };
-    let _ = Text::new(message, Point::new(12, 60), body_style).draw(display);
+fn draw_sensor_error(
+    display: &mut MemoryDisplay<DisplaySpi<'_>, Output<'static>, TiedHighDisplayPin>,
+    ui_state: &mut UiState,
+    error: SensorError,
+    refresh_count: u32,
+) -> bool {
+    let body_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::Off);
+    let (message, detail) = format_sensor_error(error);
 
-    if let SensorError::WhoAmI(value) = error {
-        let mut detail: String<32> = String::new();
-        let _ = write!(&mut detail, "whoami=0x{:04X}", value);
-        let _ = Text::new(&detail, Point::new(12, 76), body_style).draw(display);
-    }
+    let mut needs_flush = false;
+    needs_flush |= update_text_field(
+        display,
+        &mut ui_state.error_message,
+        message,
+        12,
+        52,
+        200,
+        12,
+        12,
+        60,
+        body_style,
+    );
+    needs_flush |= update_text_field(
+        display,
+        &mut ui_state.error_detail,
+        detail.as_str(),
+        12,
+        68,
+        200,
+        12,
+        12,
+        76,
+        body_style,
+    );
+    needs_flush |= draw_status_overlay(display, ui_state, refresh_count);
 
-    draw_status_overlay(display, refresh_count);
-
-    display.flush_buffer();
+    needs_flush
 }
 
 fn draw_status_overlay(
     display: &mut MemoryDisplay<DisplaySpi<'_>, Output<'static>, TiedHighDisplayPin>,
+    ui_state: &mut UiState,
     refresh_count: u32,
-) {
+) -> bool {
     let body_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::Off);
-    let clear_style = PrimitiveStyle::with_fill(BinaryColor::On);
-
-    clear_line(display, 320, 0, 80, 14, clear_style);
-    clear_line(display, 232, 194, 168, 42, clear_style);
 
     let mut refresh_text: String<16> = String::new();
     let _ = write!(&mut refresh_text, "R{:05}", refresh_count % 100_000);
-    let _ = Text::new(&refresh_text, Point::new(324, 10), body_style).draw(display);
-
-    let led_us = LED_TASK_US.load(Ordering::Relaxed);
-    let sens_us = SENSOR_TASK_US.load(Ordering::Relaxed);
-    let draw_us = DRAW_TASK_US.load(Ordering::Relaxed);
-    let loop_us = LOOP_TASK_US.load(Ordering::Relaxed);
 
     let mut led_text: String<24> = String::new();
-    let _ = write!(&mut led_text, "LED {:>5}us", led_us);
-    let _ = Text::new(&led_text, Point::new(232, 202), body_style).draw(display);
+    let _ = write!(&mut led_text, "LED {:>7}us", LED_TASK_US.load(Ordering::Relaxed));
 
-    let mut sens_text: String<24> = String::new();
-    let _ = write!(&mut sens_text, "SNS {:>5}us", sens_us);
-    let _ = Text::new(&sens_text, Point::new(232, 214), body_style).draw(display);
+    let mut sensor_text: String<24> = String::new();
+    let _ = write!(&mut sensor_text, "SNS {:>7}us", SENSOR_TASK_US.load(Ordering::Relaxed));
 
-    let mut draw_text: String<24> = String::new();
-    let _ = write!(&mut draw_text, "DRW {:>5}us", draw_us);
-    let _ = Text::new(&draw_text, Point::new(232, 226), body_style).draw(display);
+    let mut cpu_text: String<24> = String::new();
+    let _ = write!(&mut cpu_text, "CPU {:>7}us", CPU_TASK_US.load(Ordering::Relaxed));
+
+    let mut flush_text: String<24> = String::new();
+    let _ = write!(&mut flush_text, "FLU {:>7}us", FLUSH_TASK_US.load(Ordering::Relaxed));
 
     let mut loop_text: String<24> = String::new();
-    let _ = write!(&mut loop_text, "LOP {:>5}us", loop_us);
-    let _ = Text::new(&loop_text, Point::new(232, 238), body_style).draw(display);
+    let _ = write!(&mut loop_text, "LOP {:>7}us", LOOP_TASK_US.load(Ordering::Relaxed));
+
+    let mut needs_flush = false;
+    needs_flush |= update_text_field(
+        display,
+        &mut ui_state.refresh_text,
+        refresh_text.as_str(),
+        320,
+        0,
+        80,
+        14,
+        324,
+        10,
+        body_style,
+    );
+    needs_flush |= update_text_field(
+        display,
+        &mut ui_state.led_text,
+        led_text.as_str(),
+        220,
+        182,
+        180,
+        12,
+        220,
+        190,
+        body_style,
+    );
+    needs_flush |= update_text_field(
+        display,
+        &mut ui_state.sensor_text,
+        sensor_text.as_str(),
+        220,
+        194,
+        180,
+        12,
+        220,
+        202,
+        body_style,
+    );
+    needs_flush |= update_text_field(
+        display,
+        &mut ui_state.cpu_text,
+        cpu_text.as_str(),
+        220,
+        206,
+        180,
+        12,
+        220,
+        214,
+        body_style,
+    );
+    needs_flush |= update_text_field(
+        display,
+        &mut ui_state.flush_text,
+        flush_text.as_str(),
+        220,
+        218,
+        180,
+        12,
+        220,
+        226,
+        body_style,
+    );
+    needs_flush |= update_text_field(
+        display,
+        &mut ui_state.loop_text,
+        loop_text.as_str(),
+        220,
+        230,
+        180,
+        10,
+        220,
+        238,
+        body_style,
+    );
+
+    needs_flush
 }
 
-fn clear_line(
+fn update_text_field<const N: usize>(
+    display: &mut MemoryDisplay<DisplaySpi<'_>, Output<'static>, TiedHighDisplayPin>,
+    cache: &mut String<N>,
+    new_text: &str,
+    clear_x: i32,
+    clear_y: i32,
+    clear_width: u32,
+    clear_height: u32,
+    text_x: i32,
+    text_y: i32,
+    style: MonoTextStyle<'_, BinaryColor>,
+) -> bool {
+    if cache.as_str() == new_text {
+        return false;
+    }
+
+    clear_rect(display, clear_x, clear_y, clear_width, clear_height);
+    if !new_text.is_empty() {
+        let _ = Text::new(new_text, Point::new(text_x, text_y), style).draw(display);
+    }
+
+    cache.clear();
+    let _ = cache.push_str(new_text);
+    true
+}
+
+fn clear_rect(
     display: &mut MemoryDisplay<DisplaySpi<'_>, Output<'static>, TiedHighDisplayPin>,
     x: i32,
     y: i32,
     width: u32,
     height: u32,
-    style: PrimitiveStyle<BinaryColor>,
 ) {
+    let clear_style = PrimitiveStyle::with_fill(BinaryColor::On);
     let _ = Rectangle::new(Point::new(x, y), Size::new(width, height))
-        .into_styled(style)
+        .into_styled(clear_style)
         .draw(display);
 }
 
@@ -431,8 +738,47 @@ fn crc8(data_24: u32) -> u8 {
     !crc
 }
 
+fn format_sensor_error(error: SensorError) -> (&'static str, String<32>) {
+    let mut detail: String<32> = String::new();
+
+    let message = match error {
+        SensorError::Spi => "SPI transfer failed",
+        SensorError::Crc => "CRC mismatch",
+        SensorError::UnexpectedResponse => "off-frame mismatch",
+        SensorError::StartupStatus(0) => "startup in progress",
+        SensorError::StartupStatus(1) => "status says ok",
+        SensorError::StartupStatus(3) => "status flag set",
+        SensorError::StartupStatus(_) => "status reserved",
+        SensorError::WhoAmI(value) => {
+            let _ = write!(&mut detail, "whoami=0x{:04X}", value);
+            "WHOAMI mismatch"
+        }
+    };
+
+    (message, detail)
+}
+
 fn elapsed_micros_u32(started: Instant) -> u32 {
     started.elapsed().as_micros().min(u32::MAX as u64) as u32
+}
+
+fn flush_or_keepalive(
+    display: &mut MemoryDisplay<DisplaySpi<'_>, Output<'static>, TiedHighDisplayPin>,
+    ui_state: &mut UiState,
+    needs_flush: bool,
+) -> u32 {
+    if needs_flush {
+        let flush_started = Instant::now();
+        display.flush_buffer();
+        ui_state.last_flush_at = Instant::now();
+        elapsed_micros_u32(flush_started)
+    } else if ui_state.last_flush_at.elapsed() >= Duration::from_millis(500) {
+        display.display_mode();
+        ui_state.last_flush_at = Instant::now();
+        0
+    } else {
+        0
+    }
 }
 
 #[embassy_executor::main]

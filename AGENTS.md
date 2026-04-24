@@ -16,6 +16,8 @@ The current firmware lives entirely in `src/main.rs`. It currently:
 - uses a second Embassy task that owns the shared SPI bus
 - reads the Murata SCL3300 and updates the Sharp display from that same bus-owning task
 - renders live SCL3300 X/Y/Z angle values on the display
+- shows a live overlay with refresh count plus `LED`, `SNS`, `CPU`, `FLU`, and `LOP` timing metrics
+- caches previously rendered text so only changed dynamic fields are redrawn between flushes
 
 ## Important Files
 
@@ -39,6 +41,7 @@ Notes:
 - `cargo run` uses the runner configured in `.cargo/config.toml`:
   `probe-rs run --chip nRF52840_xxAA --protocol swd`
 - The default target is already set to `thumbv7em-none-eabihf`
+- `.cargo/config.toml` also sets `DEFMT_LOG=info` so `defmt::trace!` logs from dependencies are compiled out
 - This repo currently has no dedicated test suite; `cargo check` is the fastest validation step
 
 ## Debugging
@@ -83,6 +86,7 @@ nRF52840 Feather note:
 - avoid `SPIM3` for external SPI devices if the board may boot without USB/VBUS power
 - sharing `SPIM0/TWISPI0` between the display and SCL3300 is acceptable because both devices use SPI mode 0 and separate chip-select lines
 - a mutex would be appropriate if multiple independent tasks touched the shared bus, but the current implementation keeps sensor and display traffic inside one bus-owning task because the display driver performs multi-transfer transactions under one chip-select window
+- the current display loop avoids calling `display_mode()` immediately after `flush_buffer()` and only uses it as a keepalive if no flush has happened for about 500 ms
 
 When changing wiring or board definitions, update both the firmware comments and this file.
 
